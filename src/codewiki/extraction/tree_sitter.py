@@ -48,6 +48,101 @@ _SKIP_RECEIVERS = frozenset(["self", "this", "cls", "super", "parent", "static"]
 # Instantiation node types (new Foo())
 _INSTANTIATION_TYPES = frozenset(["object_creation_expression", "class_literal"])
 
+# Node types to skip when walking for calls inside function bodies.
+# Descending into string/comment/annotation nodes can trigger false
+# method_invocation matches when tree-sitter-java misparses Java 21
+# text blocks or annotation arguments (e.g. @Bean method bodies).
+# Aligned with codegraph's visitForCallsAndStructure which implicitly
+# avoids these through dispatch-only recursion (tree-sitter.ts:4997-5147).
+_SKIP_WALK_TYPES = frozenset([
+    "string_literal", "text_block", "string_interpolation",
+    "line_comment", "block_comment", "comment",
+    "marker_annotation", "annotation",
+])
+
+# Valid Java identifier pattern (for call extraction garbage defense).
+# Reject method_invocation names that contain newlines, annotations,
+# or other non-identifier characters.  Tree-sitter-java can produce
+# malformed method_invocation nodes for Java 21 text blocks / annotation
+# heavy Spring methods; this is the last-resort defense at the
+# unresolved-reference creation point.
+import re as _re
+_VALID_IDENTIFIER = _re.compile(r'^[A-Za-z_$][\w$]*$')
+
+def _is_valid_identifier(s: str) -> bool:
+    """True if s is a valid Java identifier (no newlines, @, parens, etc.)."""
+    return bool(_VALID_IDENTIFIER.match(s.strip()))
+
+
+# =========================================================================
+# Spring MVC route extraction (mirrors CodeGraph's @GetMapping/@PostMapping
+# -> `route` node creation, so impact analysis can surface HTTP endpoints).
+# =========================================================================
+_ROUTE_ANNOT_RE = _re.compile(r'@(\w*Mapping)\b')
+_ROUTE_PATH_RE = _re.compile(r'(?:value|path)\s*=\s*"([^"]+)"')
+_ROUTE_SINGLE_ARG_RE = _re.compile(r'\(\s*"([^"]+)"\s*\)')
+_ROUTE_METHOD_RE = _re.compile(r'method\s*=\s*(?:RequestMethod\.)?(\w+)')
+_ROUTE_METHOD_DEFAULTS = {
+    "GetMapping": "GET",
+    "PostMapping": "POST",
+    "PutMapping": "PUT",
+    "DeleteMapping": "DELETE",
+    "PatchMapping": "PATCH",
+    "RequestMapping": None,  # resolved from `method` attr, else "ALL"
+}
+
+
+def _parse_spring_route(annotation_text: str):
+    """Parse a Spring MVC mapping annotation -> (http_method, path) or None."""
+    m = _ROUTE_ANNOT_RE.search(annotation_text)
+    if not m:
+        return None
+    annot_name = m.group(1)
+    path = None
+    pm = _ROUTE_PATH_RE.search(annotation_text)
+    if pm:
+        path = pm.group(1)
+    else:
+        sm = _ROUTE_SINGLE_ARG_RE.search(annotation_text)
+        if sm:
+            path = sm.group(1)
+    if not path:
+        return None
+    if annot_name == "RequestMapping":
+        mm = _ROUTE_METHOD_RE.search(annotation_text)
+        http_method = mm.group(1).upper() if mm else "ALL"
+    else:
+        http_method = _ROUTE_METHOD_DEFAULTS.get(annot_name, "ALL")
+    return http_method, path
+
+
+def _join_route_path(prefix: str, path: str) -> str:
+    """Join a class-level prefix with a method-level path (no double slash)."""
+    if not prefix:
+        return path
+    if prefix.endswith("/") and path.startswith("/"):
+        return prefix + path[1:]
+    if not prefix.endswith("/") and not path.startswith("/"):
+        return prefix + "/" + path
+    return prefix + path
+
+
+def _find_modifiers(node: "SyntaxNode"):
+    """Return the `modifiers` child of a declaration node.
+
+    tree-sitter-java exposes modifiers as a positional child (field name is
+    None in some grammar builds), so get_child_by_field('modifiers') returns
+    None. Fall back to scanning children by type.
+    """
+    m = get_child_by_field(node, "modifiers")
+    if m:
+        return m
+    for i in range(node.child_count):
+        c = node.child(i)
+        if c and c.type == "modifiers":
+            return c
+    return None
+
 
 class ExtractorContext:
     """
@@ -113,6 +208,7 @@ class TreeSitterExtractor:
         self.unresolved_references: list[UnresolvedReference] = []
         self.errors: list[ExtractionError] = []
         self.node_stack: list[str] = []
+        self._class_route_prefix: str = ""
         self._tree = None
 
     def extract(self) -> ExtractionResult:
@@ -348,6 +444,21 @@ class TreeSitterExtractor:
         if not name:
             return
 
+        # Capture class-level @RequestMapping prefix for route composition
+        # (e.g. @RequestMapping("/api") on a controller + @GetMapping("/x") on a
+        # method -> full path "/api/x"). Mirrors CodeGraph's route handling.
+        self._class_route_prefix = ""
+        modifiers = _find_modifiers(node)
+        if modifiers:
+            for i in range(modifiers.named_child_count):
+                ann = modifiers.named_child(i)
+                if ann and ann.type in ("annotation", "marker_annotation"):
+                    ann_text = get_node_text(ann, self.source)
+                    if "@RequestMapping" in ann_text:
+                        parsed = _parse_spring_route(ann_text)
+                        if parsed:
+                            self._class_route_prefix = parsed[1]
+
         # Check extends/implements for unresolved references
         extends_node = get_child_by_field(node, "superclass")
         if extends_node:
@@ -432,6 +543,45 @@ class TreeSitterExtractor:
         })
         if not method_node:
             return
+
+        # Spring MVC route extraction (mirrors CodeGraph's @GetMapping/@PostMapping
+        # -> `route` node creation, so impact surfaces the HTTP endpoint).
+        # A `route` node is linked to the method via a `decorates` edge; impact()
+        # follows it (it excludes only `contains`), so changing the method shows
+        # up as affecting the endpoint — exactly like CodeGraph's blast radius.
+        modifiers = _find_modifiers(node)
+        if modifiers:
+            for i in range(modifiers.named_child_count):
+                ann = modifiers.named_child(i)
+                if ann and ann.type in ("annotation", "marker_annotation"):
+                    ann_text = get_node_text(ann, self.source)
+                    parsed = _parse_spring_route(ann_text)
+                    if parsed:
+                        http_method, path = parsed
+                        full_path = _join_route_path(self._class_route_prefix, path)
+                        route_name = f"{http_method} {full_path}"
+                        route_line = ann.start_point[0] + 1
+                        route_id = generate_node_id(self.file_path, "route", route_name, route_line)
+                        route_node = Node(
+                            id=route_id,
+                            kind="route",
+                            name=route_name,
+                            qualified_name=self._build_qualified_name(route_name),
+                            file_path=self.file_path,
+                            language=self.language,
+                            start_line=route_line,
+                            end_line=route_line,
+                            start_column=ann.start_point[1],
+                            end_column=ann.end_point[1],
+                            updated_at=int(time.time() * 1000),
+                        )
+                        self.nodes.append(route_node)
+                        self.edges.append(Edge(
+                            source=route_id,
+                            target=method_node.id,
+                            kind="decorates",
+                            provenance="heuristic",
+                        ))
 
         # Extract parameters
         params = get_child_by_field(node, self.extractor.params_field)
@@ -546,7 +696,20 @@ class TreeSitterExtractor:
             self.create_node(kind, name, child, extra)
 
     def _extract_variable(self, node: "SyntaxNode") -> None:
-        """Extract a local variable declaration (inside method body)."""
+        """Extract a local variable declaration (inside method body).
+
+        Stores the normalized type name in return_type so that name_matcher
+        can infer receiver types for method calls (e.g. service.executeTool() →
+        look up variable "service" → type "ScriptExecutionService").
+        """
+        # Extract the declared type from the variable declaration
+        type_node = get_child_by_field(node, "type")
+        var_type: Optional[str] = None
+        if type_node:
+            from codewiki.extraction.languages.java import normalize_java_type
+            var_type = normalize_java_type(type_node, self.source)
+        extra = {"return_type": var_type} if var_type else {}
+
         for i in range(node.named_child_count):
             child = node.named_child(i)
             if not child or child.type != "variable_declarator":
@@ -557,7 +720,7 @@ class TreeSitterExtractor:
             name = get_node_text(name_node, self.source).strip()
             if not name:
                 continue
-            self.create_node("variable", name, child)
+            self.create_node("variable", name, child, extra)
 
     def _extract_import(self, node: "SyntaxNode") -> None:
         """Extract an import declaration (tree-sitter.ts:3110+)."""
@@ -598,15 +761,17 @@ class TreeSitterExtractor:
             self._extract_call(node)
         elif node_type in _INSTANTIATION_TYPES:
             self._extract_instantiation(node)
+        elif node_type == "field_access":
+            self._extract_field_access(node)
 
         # Also handle local variable declarations inside body
         if self.extractor and node_type in self.extractor.variable_types:
             self._extract_variable(node)
 
-        # Recurse
+        # Recurse — skip string/comment/annotation nodes (codegraph-aligned defense)
         for i in range(node.named_child_count):
             child = node.named_child(i)
-            if child:
+            if child and child.type not in _SKIP_WALK_TYPES:
                 self._walk_for_calls(child)
 
     def _extract_call(self, node: "SyntaxNode") -> None:
@@ -628,12 +793,20 @@ class TreeSitterExtractor:
         if name_field and object_field:
             method_name = get_node_text(name_field, self.source)
 
+            # Defend against garbage method_invocation nodes produced by
+            # tree-sitter-java for Java 21 text blocks / annotation-heavy methods.
+            if not _is_valid_identifier(method_name):
+                return
+
             # Handle fluent chain: Foo.getInstance().bar() (tree-sitter.ts:4120-4138)
             if object_field.type == "method_invocation":
                 inner_obj = get_child_by_field(object_field, "object")
                 inner_name = get_child_by_field(object_field, "name")
                 if inner_obj and inner_name:
-                    callee = f"{get_node_text(inner_obj, self.source)}.{get_node_text(inner_name, self.source)}().{method_name}"
+                    inner_name_text = get_node_text(inner_name, self.source)
+                    if not _is_valid_identifier(inner_name_text):
+                        return
+                    callee = f"{get_node_text(inner_obj, self.source)}.{inner_name_text}().{method_name}"
                     self.unresolved_references.append(UnresolvedReference(
                         from_node_id=caller_id, reference_name=callee,
                         reference_kind="calls",
@@ -654,6 +827,9 @@ class TreeSitterExtractor:
                 receiver_name = get_node_text(object_field, self.source)
 
             if method_name:
+                # Skip garbage receiver names (e.g. '@Primary\npublic...')
+                if receiver_name and ("\n" in receiver_name or "@" in receiver_name):
+                    return
                 if receiver_name in _SKIP_RECEIVERS:
                     callee = method_name
                 else:
@@ -667,7 +843,7 @@ class TreeSitterExtractor:
         elif name_field:
             # Bare call: foo()
             callee = get_node_text(name_field, self.source)
-            if callee:
+            if callee and _is_valid_identifier(callee):
                 self.unresolved_references.append(UnresolvedReference(
                     from_node_id=caller_id, reference_name=callee,
                     reference_kind="calls",
@@ -700,6 +876,49 @@ class TreeSitterExtractor:
         self.unresolved_references.append(UnresolvedReference(
             from_node_id=caller_id, reference_name=type_name,
             reference_kind="instantiates",
+            line=node.start_point[0] + 1, column=node.start_point[1],
+            file_path=self.file_path, language=self.language,
+        ))
+
+    def _extract_field_access(self, node: "SyntaxNode") -> None:
+        """Extract field access (this.field / obj.field) → references。
+
+        Skips field_access nodes that are part of a method_invocation
+        (already handled by _extract_call as receiver.method calls).
+        """
+        if not self.node_stack:
+            return
+        caller_id = self.node_stack[-1]
+        if not caller_id:
+            return
+
+        # Skip field accesses that are the object of a method_invocation
+        parent = node.parent
+        if parent and parent.type == "method_invocation":
+            return
+
+        object_field = get_child_by_field(node, "object")
+        field_node = get_child_by_field(node, "field")
+        if not field_node:
+            return
+
+        field_name = get_node_text(field_node, self.source).strip()
+        if not field_name or not _is_valid_identifier(field_name):
+            return
+
+        if object_field:
+            receiver_text = get_node_text(object_field, self.source).strip()
+            # Skip self/this/super receivers
+            if receiver_text in _SKIP_RECEIVERS:
+                ref_name = field_name
+            else:
+                ref_name = f"{receiver_text}.{field_name}"
+        else:
+            ref_name = field_name
+
+        self.unresolved_references.append(UnresolvedReference(
+            from_node_id=caller_id, reference_name=ref_name,
+            reference_kind="references",
             line=node.start_point[0] + 1, column=node.start_point[1],
             file_path=self.file_path, language=self.language,
         ))

@@ -32,8 +32,16 @@ def generate_node_id(file_path: str, kind: str, name: str, line: int) -> str:
 
 
 def get_node_text(node: "SyntaxNode", source: str) -> str:
-    """Extract text from a syntax node (tree-sitter-helpers.ts:35-37)."""
-    return source[node.start_byte : node.end_byte]
+    """
+    Extract text from a syntax node (tree-sitter-helpers.ts:35-37).
+
+    tree-sitter's start_byte/end_byte are UTF-8 byte offsets. Python string
+    slicing uses character offsets, which diverge for any non-ASCII source
+    (Chinese comments, annotations with Unicode, etc.). We encode → slice by
+    byte → decode to get the correct text regardless of multi-byte characters.
+    """
+    sb = source.encode("utf-8")
+    return sb[node.start_byte : node.end_byte].decode("utf-8")
 
 
 def get_child_by_field(node: "SyntaxNode", field_name: str) -> Optional["SyntaxNode"]:

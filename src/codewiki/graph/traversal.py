@@ -28,7 +28,8 @@ class TraversalResult:
 
 
 # Edge kinds that represent "who calls/uses this" (callers) or "what this calls/uses" (callees)
-_CALL_EDGE_KINDS = ["calls", "references", "imports", "instantiates"]
+# `uses` carries Spring DI wiring (bean injection / boot-context), added by SpringResolver.
+_CALL_EDGE_KINDS = ["calls", "references", "imports", "instantiates", "uses"]
 
 # Container node kinds — impact expands these to include their children
 _CONTAINER_KINDS = frozenset(["class", "interface", "struct", "trait", "protocol", "module", "enum"])
@@ -55,11 +56,25 @@ class GraphTraversal:
 
         Includes instantiates (construction = calling constructor, #774).
         Returns caller nodes (not the focal node itself).
+
+        For a container node (class/interface/enum), aggregates over its member
+        methods so `callers SomeClass` reflects who calls the class's methods
+        (CodeGraph parity — aligns class-level callee/caller queries).
         """
         result: list[Node] = []
         visited: set[str] = set()
-        self._callers_recursive(node_id, max_depth, 0, result, visited)
+        for seed in self._aggregate_seeds(node_id):
+            self._callers_recursive(seed, max_depth, 0, result, visited)
         return result
+
+    def _aggregate_seeds(self, node_id: str) -> list[str]:
+        """If node is a container, return it plus its member method/constructor ids."""
+        node = self.store.get_node_by_id(node_id)
+        if node and node.kind in _CONTAINER_KINDS:
+            members = self.store.get_contained_nodes(node_id, ["method", "constructor"])
+            if members:
+                return [node_id] + [m.id for m in members]
+        return [node_id]
 
     def _callers_recursive(
         self, node_id: str, max_depth: int, current_depth: int,
@@ -92,10 +107,15 @@ class GraphTraversal:
         Find all nodes called/referenced/used by this node (traversal.ts:319).
 
         Includes instantiates (function that constructs a class has it as callee, #774).
+
+        For a container node (class/interface/enum), aggregates over its member
+        methods so `callees SomeClass` reflects what the class's methods call
+        (CodeGraph parity — field.method() calls like `svc.foo()` are surfaced).
         """
         result: list[Node] = []
         visited: set[str] = set()
-        self._callees_recursive(node_id, max_depth, 0, result, visited)
+        for seed in self._aggregate_seeds(node_id):
+            self._callees_recursive(seed, max_depth, 0, result, visited)
         return result
 
     def _callees_recursive(
@@ -201,19 +221,54 @@ class GraphTraversal:
             if node:
                 return node
 
+        # Definition kinds get priority over import/file/variable (codegraph-aligned)
+        _DEF_PRIORITY = (
+            "CASE WHEN kind IN "
+            "('class','interface','enum','struct','trait','type_alias',"
+            "'method','function','module','namespace') "
+            "THEN 0 ELSE 1 END"
+        )
+
+        # FQN: if query contains dots, try qualified_name BEFORE bare name.
+        # Import nodes store FQN as their name, so bare-name search would
+        # match import nodes for FQN queries (e.g. "com.x.Service").
+        # We check qualified_name first to prefer actual definitions.
+        if "." in node_id_or_name:
+            last_dot = node_id_or_name.rfind(".")
+            fqn_last = node_id_or_name[:last_dot] + "::" + node_id_or_name[last_dot + 1:]
+            # Try exactly
+            rows = self.store.conn.execute(
+                f"SELECT * FROM nodes WHERE qualified_name = ? ORDER BY {_DEF_PRIORITY}, start_line LIMIT 1",
+                (fqn_last,)
+            ).fetchall()
+            if not rows:
+                fqn_all = node_id_or_name.replace(".", "::")
+                rows = self.store.conn.execute(
+                    f"SELECT * FROM nodes WHERE qualified_name LIKE '%' || ? ORDER BY {_DEF_PRIORITY}, start_line LIMIT 1",
+                    (fqn_all,)
+                ).fetchall()
+            if rows:
+                from codewiki.db.store import _row_to_node
+                return _row_to_node(rows[0])
+
         # Try by name (case-sensitive first, then case-insensitive)
+        # Definition nodes (class/method/...) prioritized over import/etc.
         rows = self.store.conn.execute(
-            "SELECT * FROM nodes WHERE name = ? ORDER BY start_line LIMIT 1",
+            f"SELECT * FROM nodes WHERE name = ? ORDER BY {_DEF_PRIORITY}, start_line LIMIT 1",
             (node_id_or_name,)
         ).fetchall()
         if not rows:
             rows = self.store.conn.execute(
-                "SELECT * FROM nodes WHERE lower(name) = lower(?) ORDER BY start_line LIMIT 1",
+                f"SELECT * FROM nodes WHERE lower(name) = lower(?) ORDER BY {_DEF_PRIORITY}, start_line LIMIT 1",
                 (node_id_or_name,)
             ).fetchall()
         if rows:
             from codewiki.db.store import _row_to_node
             return _row_to_node(rows[0])
+
+            if rows:
+                from codewiki.db.store import _row_to_node
+                return _row_to_node(rows[0])
 
         return None
 

@@ -1,0 +1,13 @@
+# CodeWiki generated output
+wiki/
+agent.md
+
+# Reference materials (not part of the package)
+resource/
+
+# IDE / tooling
+.idea/
+.pytest_cache/
+__pycache__/
+*.pyc
+*.egg-info/

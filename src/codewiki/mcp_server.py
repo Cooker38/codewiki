@@ -1,10 +1,14 @@
 """
-CodeWiki MCP Server — 8 tools via FastMCP stdio transport.
+CodeWiki MCP Server — single tool via FastMCP stdio transport.
 
-Graph tools: codewiki_node / callers / callees / impact / search / explore
-Build tools: codewiki_init / codewiki_sync
+MCP tools: codewiki_explore  (read-only query — the ONLY tool exposed to agents)
 
-Startup: discover .codewiki/ from CWD, open SQLite if exists.
+Building / refreshing the graph is done OUT OF BAND via the CLI
+(`codewiki init <root>` / `codewiki sync`) — never inside an MCP tool handler,
+so a long-running build can never block the stdio event loop (which previously
+made the connector crash with "unavailable after recovery" on large repos).
+
+Startup: discover .codewiki/ from CWD, open the existing SQLite graph if present.
 """
 
 from __future__ import annotations
@@ -17,12 +21,25 @@ from typing import Any, Optional
 from mcp.server.fastmcp import FastMCP
 
 from codewiki.db.store import GraphStore
-from codewiki.extraction.orchestrator import ExtractionOrchestrator
-from codewiki.resolution.resolver import ReferenceResolver
-from codewiki.resolution.callback_synthesizer import CallbackSynthesizer
 from codewiki.graph.traversal import GraphTraversal
 
 mcp = FastMCP("codewiki")
+
+
+def _check_ready() -> str | None:
+    """Return error message if not ready, None if OK."""
+    from codewiki.sync.reconciler import is_syncing
+    if is_syncing():
+        return "CodeWiki is currently syncing. Please retry in a moment."
+    if not _traversal:
+        _ensure_store()  # auto-open an existing .codewiki graph if present
+    if not _traversal:
+        return (
+            "No code graph indexed for this project.\n"
+            "Build it first from a terminal: `codewiki init <project_root>` "
+            "(e.g. `codewiki init .`). The graph is NOT built automatically inside the agent."
+        )
+    return None
 
 # Global state — initialized on first use
 _store: Optional[GraphStore] = None
@@ -107,6 +124,33 @@ def _format_node_detail(node) -> str:
     return "\n".join(lines)
 
 
+def _extract_source_block(focal, project_root: Optional[str]) -> Optional[str]:
+    """Read the source code for a node from its file (start_line to end_line).
+
+    Used by explore to include actual code so the agent doesn't need a separate
+    Read call. Limited to ~100 lines max to stay within budget.
+    """
+    if not project_root or not focal.file_path:
+        return None
+    file_path = os.path.join(project_root, focal.file_path)
+    if not os.path.isfile(file_path):
+        return None
+    try:
+        with open(file_path, encoding="utf-8", errors="ignore") as f:
+            all_lines = f.readlines()
+        start = max(0, focal.start_line - 1)
+        end = min(len(all_lines), focal.end_line)
+        if end - start > 100:
+            end = start + 100
+        return "".join(all_lines[start:end])
+    except Exception:
+        return None
+
+# NOTE: AGENTS.md / CLAUDE.md injection now lives in `codewiki.bootstrap`
+# (invoked by `codewiki init`, the CLI — NOT by the MCP server, since building
+# the graph is a CLI-only concern and must never run inside an MCP handler).
+
+
 # =========================================================================
 # Explore budget algorithm (aligned with codegraph getExploreOutputBudget)
 # =========================================================================
@@ -128,7 +172,7 @@ def _get_explore_budget() -> dict:
 # Graph query tools
 # =========================================================================
 
-@mcp.tool()
+# (CLI-only, not exposed as MCP tool — codegraph-aligned)
 def codewiki_node(symbol: str) -> str:
     """Get details of a code symbol by name or ID.
 
@@ -138,18 +182,18 @@ def codewiki_node(symbol: str) -> str:
     Returns:
         Node details as formatted text.
     """
-    global _traversal
-    if not _traversal:
-        return "No project indexed. Use codewiki_init first."
+    err = _check_ready()
+    if err:
+        return err
     node = _traversal.get_node(symbol)
     if not node:
         return f"Symbol '{symbol}' not found."
     return _format_node_detail(node)
 
 
-@mcp.tool()
+# (CLI-only, not exposed as MCP tool)
 def codewiki_callers(symbol: str, max_depth: int = 1) -> str:
-    """Find all callers of a symbol (who calls/uses/instantiates it).
+    """Find all callers of a symbol (who calls/uses/instantiates it). USE THIS when asked to analyze call relationships / "who calls this method" / dependencies on a symbol.
 
     Includes instantiates edges (constructing a class is calling its constructor).
 
@@ -162,7 +206,7 @@ def codewiki_callers(symbol: str, max_depth: int = 1) -> str:
     """
     global _traversal
     if not _traversal:
-        return "No project indexed. Use codewiki_init first."
+        return "No project indexed. Run `codewiki init <project_root>` first."
     node = _traversal.get_node(symbol)
     if not node:
         return f"Symbol '{symbol}' not found."
@@ -175,7 +219,7 @@ def codewiki_callers(symbol: str, max_depth: int = 1) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
+# (CLI-only, not exposed as MCP tool)
 def codewiki_callees(symbol: str, max_depth: int = 1) -> str:
     """Find all callees of a symbol (what it calls/uses/instantiates).
 
@@ -190,7 +234,7 @@ def codewiki_callees(symbol: str, max_depth: int = 1) -> str:
     """
     global _traversal
     if not _traversal:
-        return "No project indexed. Use codewiki_init first."
+        return "No project indexed. Run `codewiki init <project_root>` first."
     node = _traversal.get_node(symbol)
     if not node:
         return f"Symbol '{symbol}' not found."
@@ -203,9 +247,9 @@ def codewiki_callees(symbol: str, max_depth: int = 1) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
+# (CLI-only, not exposed as MCP tool)
 def codewiki_impact(symbol: str, max_depth: int = 3) -> str:
-    """Calculate the impact radius (blast radius) of changing a symbol.
+    """Calculate the impact radius (blast radius) of changing a symbol. USE THIS when asked about the impact / affected scope / "what breaks if I change this" of a symbol.
 
     Finds all nodes that depend on the given symbol. Excludes contains edges
     (a container doesn't depend on its members). Container nodes expand to
@@ -220,7 +264,7 @@ def codewiki_impact(symbol: str, max_depth: int = 3) -> str:
     """
     global _traversal
     if not _traversal:
-        return "No project indexed. Use codewiki_init first."
+        return "No project indexed. Run `codewiki init <project_root>` first."
     node = _traversal.get_node(symbol)
     if not node:
         return f"Symbol '{symbol}' not found."
@@ -236,7 +280,7 @@ def codewiki_impact(symbol: str, max_depth: int = 3) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
+# (CLI-only, not exposed as MCP tool)
 def codewiki_search(query: str, limit: int = 50) -> str:
     """Search for code symbols by name, docstring, or signature using FTS5.
 
@@ -251,7 +295,7 @@ def codewiki_search(query: str, limit: int = 50) -> str:
     """
     global _traversal
     if not _traversal:
-        return "No project indexed. Use codewiki_init first."
+        return "No project indexed. Run `codewiki init <project_root>` first."
     results = _traversal.search(query, limit=limit)
     if not results:
         return f"No results for '{query}'."
@@ -263,23 +307,52 @@ def codewiki_search(query: str, limit: int = 50) -> str:
 
 @mcp.tool()
 def codewiki_explore(symbol: str) -> str:
-    """Explore a symbol's full context with adaptive budget.
+    """Explore a symbol's full context: node details + source code + callers + callees + blast-radius impact.
 
-    Returns: node details, callers, callees, and related symbols within
-    the budget limit (scaled by project size).
+    PREFER THIS TOOL OVER Grep/Read FOR CODE LOOKUP. Use codewiki_explore (not Grep/Read)
+    whenever you need to find a definition, see callers/callees, trace a call chain, or
+    assess impact. Only fall back to Grep/Read when you already know the exact file path
+    or need a literal substring/pattern match inside a known file.
+
+    It returns everything you need in one call — no need to follow up with node/callers/
+    callees separately, and the focal source is included verbatim so you do NOT need a
+    separate Read. A blast-radius "Impact" section lists everything that depends on the
+    symbol (including HTTP route nodes and Spring-wired callers).
+
+    If the exact symbol is not found, this tool auto-searches the graph and returns the
+    closest candidate symbols — try one of those instead of switching to Grep.
 
     Args:
-        symbol: Symbol name or ID.
+        symbol: Symbol name (bare name like "DiscountService"), FQN
+                ("com.example.DiscountService"), or node ID.
 
     Returns:
-        Combined context view of the symbol and its graph neighborhood.
+        Combined context view of the symbol and its graph neighborhood (or, on miss,
+        the closest matching symbols found via fuzzy search).
     """
     global _traversal, _store
+    _ensure_store()  # auto-open an existing .codewiki graph if present
     if not _traversal:
-        return "No project indexed. Use codewiki_init first."
+        return (
+            "No code graph indexed for this project.\n"
+            "Build it first from a terminal: `codewiki init <project_root>` "
+            "(e.g. `codewiki init .`). The graph is NOT built automatically inside the agent."
+        )
     node = _traversal.get_node(symbol)
     if not node:
-        return f"Symbol '{symbol}' not found."
+        # RC-3 fix: input-contract mismatch — the agent often has a keyword, not an exact
+        # symbol. Fall back to FTS and surface candidates instead of a dead-end "not found".
+        try:
+            candidates = _store.search_nodes_fts(symbol, limit=8) if _store else []
+        except Exception:
+            candidates = []
+        if candidates:
+            lines = [f"Symbol '{symbol}' not found exactly. Did you mean one of these? "
+                     f"Call codewiki_explore on the chosen name:"]
+            for cand, _score in candidates:
+                lines.append(f"- `{cand.file_path}:{cand.start_line}` **{cand.name}** ({cand.kind})")
+            return "\n".join(lines)
+        return f"Symbol '{symbol}' not found and no close matches in the graph."
 
     budget = _get_explore_budget()
     max_nodes = budget["max_nodes"]
@@ -288,7 +361,14 @@ def codewiki_explore(symbol: str) -> str:
     # 1. Node detail
     lines.append(_format_node_detail(node))
 
-    # 2. Callers (budgeted)
+    # 2. Source code (focal node — agent should NOT separately Read this file)
+    source_block = _extract_source_block(node, _project_root)
+    if source_block:
+        lines.append(f"\n## Source\n```java\n{source_block}\n```\n"
+                      f"*(Source above is complete and verbatim. Treat as already Read — "
+                      f"do not call Read on `{node.file_path}`.)*")
+
+    # 3. Callers (budgeted)
     callers = _traversal.callers(node.id, max_depth=1)
     if callers:
         take = min(len(callers), max_nodes // 3)
@@ -296,7 +376,7 @@ def codewiki_explore(symbol: str) -> str:
         for c in callers[:take]:
             lines.append(f"- `{c.file_path}:{c.start_line}` **{c.name}** ({c.kind})")
 
-    # 3. Callees (budgeted)
+    # 4. Callees (budgeted)
     callees = _traversal.callees(node.id, max_depth=1)
     if callees:
         take = min(len(callees), max_nodes // 3)
@@ -304,7 +384,18 @@ def codewiki_explore(symbol: str) -> str:
         for c in callees[:take]:
             lines.append(f"- `{c.file_path}:{c.start_line}` **{c.name}** ({c.kind})")
 
-    # 4. Containing ancestor
+    # 4.5 Impact / blast radius (codegraph-aligned: "what depends on this")
+    # CodeGraph's explore shows "Blast radius — what depends on these". Route
+    # nodes (HTTP endpoints) and Spring-wired callers appear here too.
+    impact_result = _traversal.impact(node.id, max_depth=3)
+    impact_others = [n for n in impact_result.nodes if n.id != node.id]
+    if impact_others:
+        take = min(len(impact_others), max_nodes // 3)
+        lines.append(f"\n## Impact (blast radius, {len(impact_others)} dependents, showing {take})")
+        for n in impact_others[:take]:
+            lines.append(f"- `{n.file_path}:{n.start_line}` **{n.name}** ({n.kind})")
+
+    # 5. Containing ancestor
     if _store:
         ancestors = _store.get_incoming_edges(node.id, ["contains"])
         if ancestors:
@@ -314,121 +405,52 @@ def codewiki_explore(symbol: str) -> str:
                 if parent:
                     lines.append(f"Contained in: `{parent.file_path}:{parent.start_line}` **{parent.name}** ({parent.kind})")
 
-    # 5. Budget annotation
-    lines.append(f"\n---\n*Explore budget: project has ~{len(_store.get_all_files())} files, output capped at ~{budget['max_chars']} chars.*")
+    # 5.5 Related source (cluster) — CodeGraph parity: dump verbatim source for
+    # the focal symbol's direct callers + callees so the agent sees the whole
+    # dependency cluster without extra Read calls.
+    related: list = []
+    seen_ids: set[str] = set()
+    for c in list(callers) + list(callees):
+        if c.id in seen_ids:
+            continue
+        seen_ids.add(c.id)
+        if c.kind in ("import", "namespace"):
+            continue
+        related.append(c)
+    if related:
+        shown = 0
+        lines.append("\n## Related source (cluster)")
+        for c in related:
+            if shown >= 4:
+                lines.append(f"- ... and {len(related) - shown} more (use `codewiki_explore` on each)")
+                break
+            blk = _extract_source_block(c, _project_root)
+            if blk:
+                lines.append(f"\n### {c.name} ({c.kind}) @ `{c.file_path}:{c.start_line}`\n```java\n{blk}\n```")
+                shown += 1
+
+    # 6. Budget annotation (codegraph-aligned: tell agent how many explore calls remain)
+    file_count = len(_store.get_all_files())
+    max_calls = 1 if file_count < 500 else (2 if file_count < 5000 else (3 if file_count < 15000 else (4 if file_count < 25000 else 5)))
+    lines.append(
+        f"\n---\n"
+        f"*Explore budget: {_get_explore_budget()['max_chars']} chars max output. "
+        f"Project has {file_count} files → ~{max_calls} explore calls recommended. "
+        f"Keep using codewiki_explore for further graph queries — do not fall back to Read.*"
+    )
 
     return "\n".join(lines)
 
 
 # =========================================================================
-# Build tools
+# Build tools are intentionally NOT exposed as MCP tools.
+# `codewiki init` / `codewiki sync` live in cli.py and run in the terminal.
+# Keeping long-running builds out of the MCP handler avoids blocking the
+# stdio event loop (which previously crashed the connector on large repos
+# with "unavailable after recovery").
 # =========================================================================
 
-@mcp.tool()
-def codewiki_init(project_root: str) -> str:
-    """Build the code knowledge graph for a project (first time).
-
-    Scans Java source files, extracts symbols and relationships with tree-sitter,
-    resolves cross-file references, and stores the graph in .codewiki/.
-
-    No wiki documents are generated — this builds the graph only.
-
-    Args:
-        project_root: Absolute path to the project root directory.
-
-    Returns:
-        Build statistics (files indexed, nodes/edges created, framework detected).
-    """
-    global _store, _traversal, _project_root
-
-    root = os.path.abspath(project_root)
-    if not os.path.isdir(root):
-        return f"Project root not found: {root}"
-
-    # Initialize store
-    codewiki_dir = os.path.join(root, ".codewiki")
-    os.makedirs(codewiki_dir, exist_ok=True)
-    db_path = os.path.join(codewiki_dir, "codewiki.db")
-
-    _store = GraphStore(db_path)
-    _store.init_schema()
-    _project_root = root
-
-    # Build graph
-    orch = ExtractionOrchestrator(root, _store)
-    result = orch.index_all()
-
-    if result.files_indexed == 0:
-        return f"No Java files found in {root}. Check the project directory."
-
-    # Resolve references
-    resolver = ReferenceResolver(_store, frameworks=result.detected_frameworks)
-    resolution_result = resolver.resolve_and_persist()
-
-    # Synthesize
-    synth = CallbackSynthesizer(_store)
-    synth_counts = synth.synthesize_all()
-
-    _traversal = GraphTraversal(_store)
-
-    lines = [
-        "## CodeWiki Graph Built",
-        f"- **Files indexed**: {result.files_indexed}",
-        f"- **Nodes created**: {result.nodes_created}",
-        f"- **Edges created**: {result.edges_created}",
-        f"- **References resolved**: {resolution_result.resolved}",
-        f"- **References unresolved**: {resolution_result.unresolved}",
-        f"- **Synthesized**: type_of={synth_counts.get('type_of',0)}, returns={synth_counts.get('returns',0)}, overrides={synth_counts.get('overrides',0)}",
-        f"- **Frameworks detected**: {', '.join(result.detected_frameworks) if result.detected_frameworks else 'none'}",
-        f"- **Duration**: {result.duration_ms}ms",
-    ]
-    if result.errors:
-        lines.append(f"\n**Errors**: {len(result.errors)}")
-        for e in result.errors[:5]:
-            lines.append(f"  - {e['filePath']}: {e['message']}")
-
-    return "\n".join(lines)
-
-
-@mcp.tool()
-def codewiki_sync() -> str:
-    """Re-index changed files (incremental update placeholder).
-
-    Currently performs a full re-index. Incremental git diff-driven sync
-    will be implemented in a future phase.
-
-    Returns:
-        Build statistics for the sync run.
-    """
-    global _store, _traversal, _project_root
-
-    root = _project_root or _find_codewiki_dir(".")
-    if not root:
-        return "No project found. Use codewiki_init first."
-
-    if not _store:
-        return "Store not open. Use codewiki_init first."
-
-    orch = ExtractionOrchestrator(root, _store)
-    result = orch.index_all()
-
-    resolver = ReferenceResolver(_store, frameworks=result.detected_frameworks)
-    resolution_result = resolver.resolve_and_persist()
-
-    synth = CallbackSynthesizer(_store)
-    synth.synthesize_all()
-
-    _traversal = GraphTraversal(_store)
-
-    lines = [
-        "## CodeWiki Sync Complete",
-        f"- **Files indexed**: {result.files_indexed}",
-        f"- **Nodes**: {result.nodes_created}",
-        f"- **Edges**: {result.edges_created}",
-        f"- **Refs resolved**: {resolution_result.resolved}",
-        f"- **Duration**: {result.duration_ms}ms",
-    ]
-    return "\n".join(lines)
+# (build/sync are CLI-only — `codewiki init` / `codewiki sync`)
 
 
 # =========================================================================
@@ -436,7 +458,13 @@ def codewiki_sync() -> str:
 # =========================================================================
 
 def main():
-    """Run the MCP server over stdio."""
+    """Run the MCP server over stdio.
+
+    Only serves `codewiki_explore`. Graph building/syncing is done via the
+    CLI (`codewiki init` / `codewiki sync`), never here — so a long build
+    can never block the stdio event loop.
+    """
+    _ensure_store()  # auto-open an existing .codewiki graph on startup
     mcp.run()
 
 

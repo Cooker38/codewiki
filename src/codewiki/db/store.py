@@ -34,7 +34,7 @@ class GraphStore:
     """
 
     def __init__(self, db_path: str = ":memory:"):
-        self._conn = sqlite3.connect(db_path, isolation_level=None)  # autocommit off, manual transactions
+        self._conn = sqlite3.connect(db_path, isolation_level=None, check_same_thread=False)  # autocommit off, manual transactions; cross-thread access for tools
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
@@ -113,6 +113,25 @@ class GraphStore:
     def get_node_by_id(self, node_id: str) -> Optional[Node]:
         row = self._conn.execute("SELECT * FROM nodes WHERE id = ?", (node_id,)).fetchone()
         return _row_to_node(row) if row else None
+
+    def get_contained_nodes(self, container_id: str, kinds: Optional[list[str]] = None) -> list[Node]:
+        """Return nodes directly contained by `container_id` via a `contains` edge.
+
+        Used by GraphTraversal to aggregate callers/callees over a class's
+        member methods (CodeGraph parity: callees on a class reflects its
+        methods' callees).
+        """
+        sql = (
+            "SELECT n.* FROM nodes n JOIN edges e ON e.target = n.id "
+            "WHERE e.source = ? AND e.kind = 'contains'"
+        )
+        params: list[Any] = [container_id]
+        if kinds:
+            placeholders = ",".join("?" * len(kinds))
+            sql += f" AND n.kind IN ({placeholders})"
+            params.extend(kinds)
+        rows = self._conn.execute(sql, params).fetchall()
+        return [_row_to_node(r) for r in rows]
 
     def get_nodes_by_file(self, file_path: str) -> list[Node]:
         rows = self._conn.execute(
@@ -222,6 +241,28 @@ class GraphStore:
         rows = self._conn.execute("SELECT * FROM files ORDER BY path").fetchall()
         return [_row_to_file(r) for r in rows]
 
+    def get_cross_file_incoming_edges(self, file_path: str) -> list[dict]:
+        """
+        Snapshot incoming edges whose target is in the given file and source is
+        in a DIFFERENT file. Returns (source, target_id, kind, line, col, target_kind, target_name).
+
+        Used before deleting a file for re-index — these edges would be lost
+        due to FK cascade; we remap them to new target ids after re-insert.
+        Aligned with codegraph storeExtractionResult cross-file edge resurrection
+        (01-存储层与Schema.md §5, extraction/index.ts:2177-2265).
+        """
+        rows = self._conn.execute(
+            """SELECT e.source, e.target, e.kind, e.line, e.col,
+                      tn.kind as target_kind, tn.name as target_name
+            FROM edges e
+            JOIN nodes sn ON sn.id = e.source
+            JOIN nodes tn ON tn.id = e.target
+            WHERE tn.file_path = ?
+            AND sn.file_path != ?""",
+            (file_path, file_path),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     def delete_file(self, file_path: str) -> None:
         """Delete a file record and its nodes (cascade)."""
         self._conn.execute("BEGIN")
@@ -309,19 +350,65 @@ class GraphStore:
     # FTS5 search
     # =========================================================================
 
-    def search_nodes_fts(self, query: str, limit: int = 50) -> list[tuple[Node, float]]:
-        """FTS5 BM25 search on node names/qualified_names/docstrings/signatures."""
+    def search_nodes_fts(self, query: str, limit: int = 50, exclude_imports: bool = True) -> list[tuple[Node, float]]:
+        """FTS5 BM25 search on node names/qualified_names/docstrings/signatures.
+
+        By default excludes import nodes (avoid flooding results with
+        e.g. 44k import paths matching a common term). Aligned with
+        codegraph's context/index.ts:550-552.
+
+        When FTS5 returns nothing, falls back to LIKE on name/qualified_name
+        (handles camelCase substring search like "clarification"
+        → "ClarificationGateAdvisor").
+        """
         if not query or not query.strip():
             return []
+
+        import_filter = "AND n.kind != 'import'" if exclude_imports else ""
         rows = self._conn.execute(
-            """SELECT n.*, bm25(nodes_fts) as score
+            f"""SELECT n.*, bm25(nodes_fts) as score
             FROM nodes_fts
             JOIN nodes n ON nodes_fts.id = n.id
-            WHERE nodes_fts MATCH ?
+            WHERE nodes_fts MATCH ? {import_filter}
             ORDER BY score
             LIMIT ?""",
             (query, limit),
         ).fetchall()
+
+        # Vocab fallback: semantic segment-level search using name_segment_vocab.
+        # Handles camelCase sub-word queries that FTS5 misses
+        # (e.g. "clarification" → ClarificationGateAdvisor via segment match).
+        # Runs BEFORE LIKE because segment matching is more semantically precise.
+        if not rows and exclude_imports:
+            from codewiki.search.identifier_segments import split_identifier_segments
+            segments = split_identifier_segments(query)
+            if segments:
+                placeholders = ",".join(["?"] * len(segments))
+                rows = self._conn.execute(
+                    f"""SELECT n.*, (COUNT(*) * 0.2 + 0.4) as score
+                    FROM name_segment_vocab v
+                    JOIN nodes n ON n.name = v.name
+                    WHERE v.segment IN ({placeholders})
+                    AND n.kind != 'import'
+                    GROUP BY n.id
+                    ORDER BY score DESC
+                    LIMIT ?""",
+                    (*segments, limit),
+                ).fetchall()
+
+        # LIKE fallback: last-resort substring scan
+        if not rows and exclude_imports:
+            like_query = f"%{query}%"
+            rows = self._conn.execute(
+                """SELECT n.*, 0.3 as score
+                FROM nodes n
+                WHERE (n.name LIKE ? OR n.qualified_name LIKE ?)
+                AND n.kind != 'import'
+                ORDER BY n.start_line
+                LIMIT ?""",
+                (like_query, like_query, limit),
+            ).fetchall()
+
         return [(_row_to_node(r), r["score"]) for r in rows]
 
     # =========================================================================
@@ -338,6 +425,30 @@ class GraphStore:
         return self._conn.execute(
             "SELECT COUNT(*) as c FROM unresolved_refs WHERE status = 'pending'"
         ).fetchone()["c"]
+
+    def get_graph_stats(self) -> dict[str, int]:
+        """Return real edge counts (by kind) and unresolved ref counts (by status).
+
+        Used by init/sync to report accurate stats instead of the contains-only
+        counts from the extraction phase.
+        """
+        edge_kinds = self._conn.execute(
+            "SELECT kind, COUNT(*) as c FROM edges GROUP BY kind"
+        ).fetchall()
+        unresolved = self._conn.execute(
+            "SELECT status, COUNT(*) as c FROM unresolved_refs GROUP BY status"
+        ).fetchall()
+
+        stats: dict[str, int] = {"edges_total": 0, "ref_resolved": 0, "ref_unresolved": 0}
+        for row in edge_kinds:
+            kind = row["kind"]
+            count = row["c"]
+            stats[f"edges_{kind}"] = count
+            stats["edges_total"] += count
+        for row in unresolved:
+            if row["status"] == "failed":
+                stats["ref_unresolved"] = row["c"]
+        return stats
 
 
 # =============================================================================

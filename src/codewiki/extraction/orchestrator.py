@@ -71,9 +71,13 @@ class ExtractionOrchestrator:
         self,
         on_progress: Optional[Callable[[IndexProgress], None]] = None,
         pool_size: Optional[int] = None,
+        force_rebuild: bool = False,
     ) -> IndexResult:
         """
         Index all Java files in the project (index.ts:1488 indexAll).
+
+        When force_rebuild=True, ignores content_hash cache and re-indexes
+        every file. Used by explicit init calls to guarantee fresh results.
         """
         start_time = time.time()
         errors: list[dict] = []
@@ -118,7 +122,7 @@ class ExtractionOrchestrator:
                     # Store
                     if result.nodes or not result.errors:
                         self._store_extraction_result(
-                            rel_path, content, "java", stat, result
+                            rel_path, content, "java", stat, result, force_rebuild=force_rebuild
                         )
 
                     if result.errors:
@@ -173,16 +177,10 @@ class ExtractionOrchestrator:
         """
         Scan for .java source files (index.ts:1167 scanDirectory).
 
-        Uses git ls-files if available (respects .gitignore),
-        falls back to filesystem walk.
+        Uses filesystem walk with .gitignore filtering (codegraph-aligned).
+        This picks up ALL Java files on disk, not just git-committed ones.
         """
-        # Try git ls-files first (respects .gitignore)
-        git_files = self._get_git_visible_files()
-        if git_files is not None:
-            return [f for f in git_files if f.endswith(".java")]
-
-        # Fallback: walk filesystem
-        return self._walk_filesystem()
+        return self._walk_filesystem_with_gitignore()
 
     def _get_git_visible_files(self) -> Optional[list[str]]:
         """Get visible files via `git ls-files` (respects .gitignore)."""
@@ -205,22 +203,74 @@ class ExtractionOrchestrator:
             pass
         return None
 
-    def _walk_filesystem(self) -> list[str]:
-        """Walk filesystem for .java files (index.ts:1228 scanDirectoryWalk)."""
+    def _walk_filesystem_with_gitignore(self) -> list[str]:
+        """
+        Walk filesystem for .java files, respecting .gitignore (codegraph-aligned).
+
+        This picks up ALL Java files on disk (including untracked/non-committed),
+        while still excluding files matched by .gitignore patterns.
+        """
         files: list[str] = []
         skip_dirs = {".git", ".codewiki", "node_modules", "target", "build", ".gradle", "out", "bin"}
 
+        # Load .gitignore patterns
+        gitignore_patterns = self._load_gitignore()
+
         for dirpath, dirnames, filenames in os.walk(self.root_dir):
+            rel_dir = os.path.relpath(dirpath, self.root_dir).replace("\\", "/")
+            if rel_dir == ".":
+                rel_dir = ""
+
             # Skip hidden and build directories
             dirnames[:] = [d for d in dirnames if d not in skip_dirs and not d.startswith(".")]
 
             for filename in filenames:
-                if filename.endswith(".java"):
-                    full_path = os.path.join(dirpath, filename)
-                    rel_path = os.path.relpath(full_path, self.root_dir).replace("\\", "/")
-                    files.append(rel_path)
+                if not filename.endswith(".java"):
+                    continue
+                full_path = os.path.join(dirpath, filename)
+                rel_path = os.path.relpath(full_path, self.root_dir).replace("\\", "/")
+
+                # Apply .gitignore
+                if self._is_gitignored(rel_path, gitignore_patterns):
+                    continue
+
+                files.append(rel_path)
 
         return sorted(files)
+
+    def _load_gitignore(self) -> list[tuple[str, Optional[re.Pattern]]]:
+        """Load .gitignore patterns from the project root (simplified)."""
+        import re
+        patterns: list[tuple[str, Optional[re.Pattern]]] = []
+        gi_path = os.path.join(self.root_dir, ".gitignore")
+        if not os.path.isfile(gi_path):
+            return patterns
+        try:
+            with open(gi_path, encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    # Convert gitignore pattern to regex
+                    try:
+                        pat = line.lstrip("/")
+                        pat = pat.replace(".", r"\.").replace("*", ".*").replace("?", ".")
+                        if line.endswith("/"):
+                            pat += ".*"
+                        patterns.append((line, re.compile(pat, re.IGNORECASE)))
+                    except re.error:
+                        patterns.append((line, None))
+        except Exception:
+            pass
+        return patterns
+
+    def _is_gitignored(self, rel_path: str, patterns: list[tuple[str, Optional[re.Pattern]]]) -> bool:
+        """Check if a relative path matches any .gitignore pattern."""
+        import fnmatch
+        for raw, regex in patterns:
+            if regex and regex.search(rel_path):
+                return True
+        return False
 
     def _store_extraction_result(
         self,
@@ -229,6 +279,7 @@ class ExtractionOrchestrator:
         language: str,
         stat: os.stat_result,
         result: ExtractionResult,
+        force_rebuild: bool = False,
     ) -> None:
         """
         Store extraction result to DB (index.ts:2154 storeExtractionResult).
@@ -240,8 +291,13 @@ class ExtractionOrchestrator:
 
         # Check if file already exists and hasn't changed
         existing_file = self.store.get_file_by_path(file_path)
-        if existing_file and existing_file.content_hash == content_hash:
-            return  # No changes
+        if not force_rebuild and existing_file and existing_file.content_hash == content_hash:
+            return  # No changes (skip when force_rebuild)
+
+        # Snapshot cross-file incoming edges BEFORE deleting (for resurrection, #899/#1240)
+        cross_file_edges = []
+        if existing_file:
+            cross_file_edges = self.store.get_cross_file_incoming_edges(file_path)
 
         # Delete existing data for this file (cascade deletes nodes + edges + unresolved_refs)
         if existing_file:
@@ -275,6 +331,49 @@ class ExtractionOrchestrator:
                 if not ref.language or ref.language == "unknown":
                     ref.language = language
             self.store.insert_unresolved_refs_batch(result.unresolved_references)
+
+        # Resurrect cross-file incoming edges (codegraph-aligned #899/#1240).
+        # After deleting + re-inserting this file's nodes, edges from OTHER files
+        # that pointed to the OLD nodes would be lost. We remap them to the new
+        # node ids by matching (kind, name).  If the target symbol was deleted
+        # or renamed, we resurrect the edge as an unresolved_ref.
+        if cross_file_edges:
+            # Build map: (kind, name) → new node id for newly inserted nodes
+            new_nodes_by_kind_name: dict[tuple[str, str], str] = {}
+            for n in valid_nodes:
+                key = (n.kind, n.name)
+                if key not in new_nodes_by_kind_name:
+                    new_nodes_by_kind_name[key] = n.id
+
+            remapped_edges: list[Edge] = []
+            resurrected_refs: list[UnresolvedReference] = []
+            for snap in cross_file_edges:
+                target_key = (snap["target_kind"], snap["target_name"])
+                new_target_id = new_nodes_by_kind_name.get(target_key)
+                if new_target_id:
+                    remapped_edges.append(Edge(
+                        source=snap["source"],
+                        target=new_target_id,
+                        kind=snap["kind"],
+                        line=snap.get("line"),
+                        column=snap.get("col"),
+                    ))
+                else:
+                    # Target was deleted — resurrect as unresolved_ref
+                    ref_name = snap["target_name"]
+                    resurrected_refs.append(UnresolvedReference(
+                        from_node_id=snap["source"],
+                        reference_name=ref_name,
+                        reference_kind=snap["kind"],
+                        line=snap.get("line") or 0,
+                        column=snap.get("col") or 0,
+                        file_path=file_path,
+                        language=language,
+                    ))
+            if remapped_edges:
+                self.store.insert_edges(remapped_edges)
+            if resurrected_refs:
+                self.store.insert_unresolved_refs_batch(resurrected_refs)
 
         # Store file record
         file_record = FileRecord(

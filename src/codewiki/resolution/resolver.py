@@ -113,7 +113,14 @@ class ReferenceResolver:
             if result:
                 return result
 
-        # Strategy 2: Name matching (method call, exact name, dotted chain)
+        # Strategy 2: Spring conventional name resolution (DI naming patterns)
+        if "spring" in self.frameworks:
+            from codewiki.resolution.frameworks.java import resolve_spring
+            result = resolve_spring(ref, self.store)
+            if result:
+                return result
+
+        # Strategy 3: Name matching (method call, exact name, dotted chain)
         result = match_reference(ref, self.store)
         if result:
             return result

@@ -299,7 +299,7 @@ class JavaExtractor:
         return False
 
     def extract_import(self, node: "SyntaxNode", source: str):
-        import_text = source[node.start_byte:node.end_byte].strip()
+        import_text = get_node_text(node, source).strip()
         scoped_id = None
         for i in range(node.named_child_count):
             child = node.named_child(i)
@@ -307,7 +307,7 @@ class JavaExtractor:
                 scoped_id = child
                 break
         if scoped_id:
-            module_name = source[scoped_id.start_byte:scoped_id.end_byte]
+            module_name = get_node_text(scoped_id, source)
             return {"module_name": module_name, "signature": import_text}
         return None
 
@@ -315,5 +315,5 @@ class JavaExtractor:
         for i in range(node.named_child_count):
             child = node.named_child(i)
             if child and child.type in ("scoped_identifier", "identifier"):
-                return source[child.start_byte:child.end_byte].strip()
+                return get_node_text(child, source).strip()
         return None

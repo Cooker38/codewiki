@@ -20,6 +20,48 @@ if TYPE_CHECKING:
 _CHAIN_PATTERN = re.compile(r"^(.+)\.(\w+)\(\)\.(\w+)$")
 
 
+def _get_import_mappings(store: "GraphStore", file_path: str) -> dict[str, str]:
+    """
+    Build a {localName: FQN} map from this file's import nodes.
+    Used by type inference to resolve imported class names to their FQN.
+    Aligned with codegraph's getImportMappings (import-resolver.ts).
+    """
+    rows = store.conn.execute(
+        "SELECT name FROM nodes WHERE kind = 'import' AND file_path = ?",
+        (file_path,)
+    ).fetchall()
+    mappings: dict[str, str] = {}
+    for row in rows:
+        fqn = row["name"]
+        last_dot = fqn.rfind(".")
+        local_name = fqn[last_dot + 1:] if last_dot >= 0 else fqn
+        if local_name and local_name != "*":
+            mappings[local_name] = fqn
+    return mappings
+
+
+def _resolve_method_on_type(
+    type_name: str, method_name: str, ref: "UnresolvedReference",
+    store: "GraphStore", confidence: float, resolved_by: str
+):
+    """
+    Find a method node whose qualified_name ends with 'typeName::methodName'.
+    Aligned with codegraph's resolveMethodOnType (name-matcher.ts:498-595).
+    """
+    rows = store.conn.execute(
+        """SELECT n.id FROM nodes n
+           WHERE n.kind = 'method' AND n.name = ?
+           AND n.qualified_name LIKE '%' || ? || '::' || ?""",
+        (method_name, type_name, method_name)
+    ).fetchall()
+    if rows:
+        return {
+            "target_node_id": rows[0]["id"],
+            "confidence": confidence,
+            "resolved_by": resolved_by,
+        }
+    return None
+
 def match_reference(ref: "UnresolvedReference", store: "GraphStore"):
     """
     Match a reference to a node (name-matcher.ts:1899-2030).
@@ -93,6 +135,63 @@ def _match_dotted_call_chain(ref: "UnresolvedReference", store: "GraphStore"):
     return None
 
 
+def _infer_field_type(field_name: str, ref: "UnresolvedReference", store: "GraphStore") -> Optional[str]:
+    """
+    Infer the type of a field by name from the containing class.
+    Aligned with codegraph's inferJavaFieldReceiverType (name-matcher.ts:1005-1052).
+
+    Strategy: find the caller's containing class → find field with same name →
+    parse type name from the field's signature (format: "<TypeName> <fieldName>").
+    """
+    # Find the containing class of the caller
+    containing_rows = store.conn.execute(
+        """SELECT e.source FROM edges e
+           WHERE e.target = ? AND e.kind = 'contains'""",
+        (ref.from_node_id,)
+    ).fetchall()
+    if not containing_rows:
+        return None
+
+    class_id = containing_rows[0]["source"]
+
+    # Find field with matching name in this class
+    field_rows = store.conn.execute(
+        """SELECT n.id, n.signature FROM nodes n
+           JOIN edges e ON e.target = n.id
+           WHERE n.kind = 'field' AND n.name = ?
+           AND e.kind = 'contains' AND e.source = ? AND n.signature IS NOT NULL""",
+        (field_name, class_id)
+    ).fetchall()
+    if not field_rows:
+        return None
+
+    sig = field_rows[0]["signature"]
+    if not sig:
+        return None
+
+    # Signature format: "private TypeName fieldName" or "TypeName fieldName"
+    # Extract the type name (tokens before the field name)
+    sig_tokens = sig.split()
+    # Remove trailing field name tokens until we get just the type
+    name_parts = field_name
+    type_tokens = []
+    for token in sig_tokens:
+        if token == name_parts:
+            break
+        type_tokens.append(token)
+
+    if not type_tokens:
+        return None
+
+    # The last token before the field name is typically the simple type name
+    type_name = type_tokens[-1]
+    # Strip generics, array brackets
+    type_name = type_name.split("<")[0].replace("[", "").replace("]", "").strip()
+    if type_name and type_name[0].isupper():
+        return type_name
+    return None
+
+
 def _match_method_call(ref: "UnresolvedReference", store: "GraphStore"):
     """
     Match `receiver.method` pattern (name-matcher.ts matchMethodCall).
@@ -125,8 +224,55 @@ def _match_method_call(ref: "UnresolvedReference", store: "GraphStore"):
     ).fetchall()
 
     if not class_rows:
-        # Try variable/field with this name, then find its type
-        # (simplified: just look for any node named `receiver`)
+        # Type inference: receiver is a variable/field, not a class name.
+        # e.g. "service.executeTool()" → receiver="service" ≠ class name "ScriptExecutionService"
+        # Strategy chain (aligned with codegraph name-matcher.ts: matchMethodCall):
+        #   (a) infer from local variable type
+        #   (b) infer from field type in the containing class
+
+        # (a) Local variable inference: find variable with same name in this file
+        var_rows = store.conn.execute(
+            "SELECT return_type FROM nodes WHERE name = ? AND kind = 'variable'"
+            " AND file_path = ? AND return_type IS NOT NULL",
+            (receiver, ref.file_path)
+        ).fetchall()
+
+        if var_rows:
+            type_name = var_rows[0]["return_type"]
+        else:
+            # (b) Field inference: find containing class, then field with same name
+            type_name = _infer_field_type(receiver, ref, store)
+
+        if type_name:
+            # Resolve FQN from import mappings
+            imports = _get_import_mappings(store, ref.file_path)
+            # Find class by type name (with import FQN preference)
+            result = _resolve_method_on_type(
+                type_name, method, ref, store, 0.85, "inferred-method-call"
+            )
+            if result:
+                return result
+
+            # Fallback: try with bare type name → find class, then its method
+            class_rows2 = store.conn.execute(
+                "SELECT id FROM nodes WHERE name = ? AND kind IN ('class','interface','struct','trait')",
+                (type_name,)
+            ).fetchall()
+            if class_rows2:
+                for cr2 in class_rows2:
+                    mr = store.conn.execute(
+                        """SELECT n.id FROM nodes n
+                           JOIN edges e ON e.target = n.id
+                           WHERE n.kind = 'method' AND n.name = ?
+                           AND e.kind = 'contains' AND e.source = ?""",
+                        (method, cr2["id"])
+                    ).fetchall()
+                    if mr:
+                        return {
+                            "target_node_id": mr[0]["id"],
+                            "confidence": 0.7,
+                            "resolved_by": "inferred-method-call",
+                        }
         return None
 
     # Find method `method` contained in that class
